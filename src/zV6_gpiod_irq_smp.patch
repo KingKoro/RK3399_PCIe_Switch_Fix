@@ -1,0 +1,234 @@
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 0529fd575..b8d92a850 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -946,6 +946,13 @@ bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr)
+ 
+ void do_serror(struct pt_regs *regs, unsigned int esr)
+ {
++	/* ignore SError to enable rk3399 PCIe bus enumeration */
++	if (esr >> ESR_ELx_EC_SHIFT == ESR_ELx_EC_SERROR) {
++		pr_debug("ignoring SError Interrupt on CPU%d\n",
++				smp_processor_id());
++		return;
++	}
++	
+ 	/* non-RAS errors are not containable */
+ 	if (!arm64_is_ras_serror(esr) || arm64_is_fatal_ras_serror(regs, esr))
+ 		arm64_serror_panic(regs, esr);
+diff --git a/drivers/pci/controller/pcie-rockchip-host.c b/drivers/pci/controller/pcie-rockchip-host.c
+index 5c74bf5e2..bf7ba8b07 100644
+--- a/drivers/pci/controller/pcie-rockchip-host.c
++++ b/drivers/pci/controller/pcie-rockchip-host.c
+@@ -36,10 +36,17 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/regmap.h>
++#include <linux/printk.h>
++#include <linux/smp.h>
+ 
+ #include "../pci.h"
+ #include "pcie-rockchip.h"
+ 
++//CPU ID to force PCIe RD/WR to run on for catchable interrupt
++#define FORCE_CPU_ID (5)
++//GPIO Pin Global Number for emulated PCIe PERST# Signal (GPIO1_C2) on RK3399
++#define EMU_GPIO_PCI_PERST (50)
++
+ static int bus_scan_delay = -1;
+ module_param_named(bus_scan_delay, bus_scan_delay, int, S_IRUGO);
+ 
+@@ -104,6 +111,20 @@ static u8 rockchip_pcie_lane_map(struct rockchip_pcie *rockchip)
+ 	return map;
+ }
+ 
++//Carrier struct for function rockchip_pcie_rd_other_conf(), castable to void*
++struct pcie_argument_carrier_castable
++{
++	//Input Parameters
++	struct rockchip_pcie *rockchip;
++	struct pci_bus *bus;
++	u32 devfn;
++	int where;
++	int size;
++	u32 *val;
++	//Return Value
++	int return_value;
++};
++
+ static int rockchip_pcie_rd_own_conf(struct rockchip_pcie *rockchip,
+ 				     int where, int size, u32 *val)
+ {
+@@ -157,37 +178,51 @@ static int rockchip_pcie_wr_own_conf(struct rockchip_pcie *rockchip,
+ 	return PCIBIOS_SUCCESSFUL;
+ }
+ 
+-static int rockchip_pcie_rd_other_conf(struct rockchip_pcie *rockchip,
+-				       struct pci_bus *bus, u32 devfn,
+-				       int where, int size, u32 *val)
++static void rockchip_pcie_rd_other_conf(void *arguments)
+ {
++	//Check if CPU ID is 5
++	//Also force deactivated Preemptive Execution
++	int this_cpu = get_cpu();
++	pr_info("[PCI Subsystem] rockchip_pcie_rd_other_conf() called with CPU Core: %d \n", this_cpu);
++	//Extract Function Arguments, cast to argument struct pointer
++	struct pcie_argument_carrier_castable *arg_ptr_casted;
++	arg_ptr_casted = (struct pcie_argument_carrier_castable*)arguments;
++
+ 	void __iomem *addr;
+ 
+-	addr = rockchip->reg_base + PCIE_ECAM_OFFSET(bus->number, devfn, where);
++	addr = arg_ptr_casted->rockchip->reg_base + PCIE_ECAM_OFFSET(arg_ptr_casted->bus->number, 
++					arg_ptr_casted->devfn, arg_ptr_casted->where);
+ 
+-	if (!IS_ALIGNED((uintptr_t)addr, size)) {
+-		*val = 0;
+-		return PCIBIOS_BAD_REGISTER_NUMBER;
++	if (!IS_ALIGNED((uintptr_t)addr, arg_ptr_casted->size)) 
++	{
++		*(arg_ptr_casted->val) = 0;
++		arg_ptr_casted->return_value = PCIBIOS_BAD_REGISTER_NUMBER;
++		put_cpu();
++		return;
+ 	}
+ 
+-	if (pci_is_root_bus(bus->parent))
+-		rockchip_pcie_cfg_configuration_accesses(rockchip,
++	if (pci_is_root_bus(arg_ptr_casted->bus->parent))
++		rockchip_pcie_cfg_configuration_accesses(arg_ptr_casted->rockchip,
+ 						AXI_WRAPPER_TYPE0_CFG);
+ 	else
+-		rockchip_pcie_cfg_configuration_accesses(rockchip,
++		rockchip_pcie_cfg_configuration_accesses(arg_ptr_casted->rockchip,
+ 						AXI_WRAPPER_TYPE1_CFG);
+ 
+-	if (size == 4) {
+-		*val = readl(addr);
+-	} else if (size == 2) {
+-		*val = readw(addr);
+-	} else if (size == 1) {
+-		*val = readb(addr);
++	if (arg_ptr_casted->size == 4) {
++		*(arg_ptr_casted->val) = readl(addr);
++	} else if (arg_ptr_casted->size == 2) {
++		*(arg_ptr_casted->val) = readw(addr);
++	} else if (arg_ptr_casted->size == 1) {
++		*(arg_ptr_casted->val) = readb(addr);
+ 	} else {
+-		*val = 0;
+-		return PCIBIOS_BAD_REGISTER_NUMBER;
++		*(arg_ptr_casted->val) = 0;
++		arg_ptr_casted->return_value = PCIBIOS_BAD_REGISTER_NUMBER;
++		put_cpu();
++		return;
+ 	}
+-	return PCIBIOS_SUCCESSFUL;
++	arg_ptr_casted->return_value = PCIBIOS_SUCCESSFUL;
++	put_cpu();
++	return;
+ }
+ 
+ static int rockchip_pcie_wr_other_conf(struct rockchip_pcie *rockchip,
+@@ -231,8 +266,26 @@ static int rockchip_pcie_rd_conf(struct pci_bus *bus, u32 devfn, int where,
+ 	if (pci_is_root_bus(bus))
+ 		return rockchip_pcie_rd_own_conf(rockchip, where, size, val);
+ 
+-	return rockchip_pcie_rd_other_conf(rockchip, bus, devfn, where, size,
+-					   val);
++	//Call rockchip_pcie_rd_other_conf() on CPU ID 5
++	//Prepare argument carrier...
++	struct pcie_argument_carrier_castable arg_carrier;
++	arg_carrier.rockchip = rockchip;
++	arg_carrier.bus = bus;
++	arg_carrier.devfn = devfn;
++	arg_carrier.where = where;
++	arg_carrier.size = size;
++	arg_carrier.val = val;
++	void *args_ptr = (void*)&arg_carrier;
++	//...and execute
++	int ret = smp_call_function_single(FORCE_CPU_ID, rockchip_pcie_rd_other_conf, args_ptr, 1);
++	//Handle Possible Error
++	if(ret)
++	{
++		pr_info("[PCI Subsystem] ERROR: Cannot run function rockchip_pcie_rd_other_conf() on specified core! \n");
++		return -1;
++	}
++	//If executed successfully, share returned value
++	return arg_carrier.return_value;
+ }
+ 
+ static int rockchip_pcie_wr_conf(struct pci_bus *bus, u32 devfn,
+@@ -301,11 +354,32 @@ static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
+ 	int err, i = MAX_LANE_NUM;
+ 	u32 status;
+ 
+-	gpiod_set_value_cansleep(rockchip->ep_gpio, 0);
++	//Create GPIO Descriptor for emulated PCIe PERST#
++	struct gpio_desc *perst_desc;
++	perst_desc = gpio_to_desc(EMU_GPIO_PCI_PERST);
++	if(perst_desc == NULL)
++	{
++    		pr_info("[PCI Subsystem] ERROR: GPIO %d Descriptor could not be created!\n", EMU_GPIO_PCI_PERST);
++    		return -1;
++  	}
++	//Set GPIO Descriptor Direction to Output
++	if(gpiod_direction_output(perst_desc, 0))
++  	{
++    		pr_info("[PCI Subsystem] ERROR: GPIO %d Setting Output Direction not successful!\n", EMU_GPIO_PCI_PERST);
++    		gpiod_put(perst_desc);
++    		return -1;
++  	}
++	gpiod_set_value_cansleep(perst_desc, 0); //Just to be sure it's logical 0
++	//gpiod_set_value_cansleep(rockchip->ep_gpio, 0);
++	
+ 
+ 	err = rockchip_pcie_init_port(rockchip);
+ 	if (err)
++	{
++		//Free GPIO Ressource
++		gpiod_put(perst_desc);
+ 		return err;
++	}
+ 
+ 	/* Fix the transmitted FTS count desired to exit from L0s. */
+ 	status = rockchip_pcie_read(rockchip, PCIE_CORE_CTRL_PLC1);
+@@ -325,12 +399,16 @@ static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
+ 	status |= PCI_EXP_LNKCTL_RCB;
+ 	rockchip_pcie_write(rockchip, status, PCIE_RC_CONFIG_LCS);
+ 
++	//Deassert PCIe PERST# Signal after 100ms to signal boot
++	msleep(100);
++	gpiod_set_value_cansleep(perst_desc, 1);
++	//gpiod_set_value_cansleep(rockchip->ep_gpio, 1);
++	msleep(500);
++
+ 	/* Enable Gen1 training */
+ 	rockchip_pcie_write(rockchip, PCIE_CLIENT_LINK_TRAIN_ENABLE,
+ 			    PCIE_CLIENT_CONFIG);
+ 
+-	gpiod_set_value_cansleep(rockchip->ep_gpio, 1);
+-
+ 	/* 500ms timeout value should be enough for Gen1/2 training */
+ 	err = readl_poll_timeout(rockchip->apb_base + PCIE_CLIENT_BASIC_STATUS1,
+ 				 status, PCIE_LINK_UP(status), 20,
+@@ -393,14 +471,18 @@ static int rockchip_pcie_host_init_port(struct rockchip_pcie *rockchip)
+ 	status &= ~PCIE_RC_CONFIG_DCSR_MPS_MASK;
+ 	status |= PCIE_RC_CONFIG_DCSR_MPS_256;
+ 	rockchip_pcie_write(rockchip, status, PCIE_RC_CONFIG_DCSR);
+-
++	//Free GPIO Ressource
++	gpiod_put(perst_desc);
+ 	return 0;
++
+ err_power_off_phy:
+ 	while (i--)
+ 		phy_power_off(rockchip->phys[i]);
+ 	i = MAX_LANE_NUM;
+ 	while (i--)
+ 		phy_exit(rockchip->phys[i]);
++	//Free GPIO Ressource
++	gpiod_put(perst_desc);
+ 	return err;
+ }
+ 
